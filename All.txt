@@ -1,0 +1,721 @@
+using DCCO.Kernel.Core.Constants;
+using DCCO.Kernel.Core.Controllers;
+using DCCO.Kernel.Core.Enums;
+using DCCO.Kernel.Core.Enums.DCCO;
+using DCCO.Kernel.Core.Infrastructure;
+using DCCO.Presentation.DCCO.Application.Services.Maker;
+using DCCO.Presentation.DCCO.Application.Services.Session;
+using DCCO.Presentation.DCCO.Application.Services.Shared;
+using DCCO.Presentation.DCCO.Domain.DTOs.AccountInfoUpdate;
+using DCCO.Presentation.DCCO.Web.UsersSecurity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using Microsoft.AspNetCore.Mvc.ViewEngines;
+using Microsoft.AspNetCore.Mvc.ViewFeatures;
+using System;
+using System.IO;
+using System.Threading.Tasks;
+
+namespace DCCO.Presentation.DCCO.Web.Controllers
+{
+    [ServiceFilter(typeof(AuthorizeLoginFilter))]
+    public class MakerController : BaseController
+    {
+        #region Fileds & Ctor
+        private readonly IApplicationLogger _logger;
+        private readonly IMakerService _makerService;
+        private readonly ICompositeViewEngine _viewEngine;
+        private readonly ISharedService _sharedService;
+        private readonly ISessionService _sessionService;
+
+        public MakerController(IApplicationLogger logger, IMakerService makerService, ICompositeViewEngine viewEngine, ISharedService sharedService, ISessionService sessionService)
+        {
+            _logger = logger;
+            _makerService = makerService;
+            _viewEngine = viewEngine;
+            _sharedService = sharedService;
+            _sessionService = sessionService;
+        }
+        #endregion
+
+        #region Methods
+        public async Task<IActionResult> ApplicationJourney()
+        {
+            //Prepare VM
+            AccountInfoUpdateDTO accountInfoUpdateDTO = new AccountInfoUpdateDTO();
+
+            accountInfoUpdateDTO.ActiveStep = _sessionService.GetInt(SessionKey.ActiveStep) ?? (int)ApplicationSteps.EntityBasicInformation;
+            _sessionService.SetInt(SessionKey.ActiveStep, accountInfoUpdateDTO.ActiveStep);
+
+            accountInfoUpdateDTO = await _makerService.PrepareVM(accountInfoUpdateDTO);
+
+            ViewData["Partial"] = await ConvertViewToString(this.ControllerContext, PartialView($"ApplicationSteps/_{Enum.GetName(typeof(ApplicationSteps), accountInfoUpdateDTO.ActiveStep)}", accountInfoUpdateDTO), _viewEngine);
+            return View(accountInfoUpdateDTO);
+        }
+        [HttpPost]
+        public async Task<IActionResult> ApplicationJourney(AccountInfoUpdateDTO accountInfoUpdateDTO)
+        {
+            await _logger.LogInformation($"Step {Enum.GetName(typeof(ApplicationSteps), accountInfoUpdateDTO.ActiveStep)} ApplicationJourney", $"Getting Response from front Action {Enum.GetName(typeof(JourneyActions), accountInfoUpdateDTO.JourneyAction)}", ActionTypes.ApplicationJourney.ToString(), accountInfoUpdateDTO, null, HttpStatusCode.Ok, LogServerity.Info, _sessionService.GetString(SessionKey.IDNumber), false);
+            if (accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.Continue || accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.AddNewParty ||
+                accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.Add_UpdatePassiveNFFEEntity || accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.DeletePassiveNFFEEntity ||
+                accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.Add_UpdatePassiveNFFEController || accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.DeletePassiveNFFEController)
+            {
+                //Validate application
+                var validModel = await _sharedService.ValidateObj(accountInfoUpdateDTO);
+                if (!validModel.Succeeded)
+                {
+                    await _logger.LogInformation($"Step {Enum.GetName(typeof(ApplicationSteps), accountInfoUpdateDTO.ActiveStep)} ApplicationJourney", $"validModel is Not valid", ActionTypes.ApplicationJourney.ToString(), validModel.BrokenRules, null, HttpStatusCode.BusinessRuleViolation, LogServerity.Info, _sessionService.GetString(SessionKey.IDNumber), false);
+                    return Json(new { isSuccess = false, resultCode = (int)HttpStatusCode.BusinessRuleViolation, brokenRoles = validModel.BrokenRules });
+                }
+
+                //Save app
+                await _makerService.SaveSteps(accountInfoUpdateDTO);
+
+                //PrepareVM
+                if (accountInfoUpdateDTO.ActiveStep == (int)ApplicationSteps.AddParty)
+                    accountInfoUpdateDTO.ActiveStep -= 1;
+                else if (accountInfoUpdateDTO.ActiveStep == (int)ApplicationSteps.EntityPartiesDetails && accountInfoUpdateDTO.JourneyAction != (int)JourneyActions.AddNewParty)
+                    accountInfoUpdateDTO.ActiveStep += 2;
+                else if (accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.Add_UpdatePassiveNFFEEntity || accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.DeletePassiveNFFEEntity ||
+                    accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.Add_UpdatePassiveNFFEController || accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.DeletePassiveNFFEController)
+                { }
+                else
+                    accountInfoUpdateDTO.ActiveStep += 1;
+
+                accountInfoUpdateDTO = await _makerService.PrepareVM(accountInfoUpdateDTO);
+            }
+            else if (accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.Back)
+            {
+                //PrepareVM
+                if (accountInfoUpdateDTO.ActiveStep == (int)ApplicationSteps.EntityAlertsAndAddress)
+                    accountInfoUpdateDTO.ActiveStep -= 2;
+                else
+                    accountInfoUpdateDTO.ActiveStep -= 1;
+                accountInfoUpdateDTO = await _makerService.PrepareVM(accountInfoUpdateDTO);
+            }
+            else if (accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.SaveForLater)
+            {
+                await _makerService.SaveSteps(accountInfoUpdateDTO);
+            }
+            else if (accountInfoUpdateDTO.JourneyAction == (int)JourneyActions.Submit)
+            {
+                await _makerService.SaveSteps(accountInfoUpdateDTO);
+            }
+            else
+            {
+                return Json(new { isSuccess = false, resultCode = (int)HttpStatusCode.BadRequest });
+            }
+
+            _sessionService.SetInt(SessionKey.ActiveStep, accountInfoUpdateDTO.ActiveStep);
+            //Build partialView for next or previous step
+            return Json(new
+            {
+                isSuccess = true,
+                resultCode = 200,
+                step = await ConvertViewToString(this.ControllerContext, PartialView($"ApplicationSteps/_{Enum.GetName(typeof(ApplicationSteps), accountInfoUpdateDTO.ActiveStep)}", accountInfoUpdateDTO), _viewEngine),
+                next = accountInfoUpdateDTO.ActiveStep
+            });
+        }
+        [HttpGet]
+        public async Task<ActionResult> CallYaqeen(string iDNumber, string birthDateHijri)
+        {
+            try
+            {
+                var result = await _makerService.CallYaqeen(iDNumber, birthDateHijri);
+                return Json(new { success = true, result = result });
+            }
+            catch (Exception ex)
+            {
+                await _logger.LogInformation($"Call Yaqeen", $"Throw Exception when CallYaqeen", ActionTypes.Yaqeen.ToString(), $"Exception Message :{ex.Message}\n Stack Trace :{ex.StackTrace}", null, HttpStatusCode.InternalError, LogServerity.Info, _sessionService.GetString(SessionKey.IDNumber), false);
+                return Json(new { success = false });
+            }
+        }
+        [HttpGet]
+        public async Task<ActionResult> CallSaudiPost(string cRnumber)
+        {
+            try
+            {
+                var result = await _makerService.CallSaudiPost(cRnumber);
+                return Json(new { success = true, result = result });
+            }
+            catch (Exception ex)
+            {
+                await _logger.LogInformation($"Call Yaqeen", $"Throw Exception when CallSaudiPost", ActionTypes.SaudiPost.ToString(), $"Exception Message :{ex.Message}\n Stack Trace :{ex.StackTrace}", null, HttpStatusCode.InternalError, LogServerity.Info, _sessionService.GetString(SessionKey.IDNumber), false);
+                return Json(new { success = false });
+            }
+        }
+        private async Task<string> ConvertViewToString(ControllerContext controllerContext, PartialViewResult pvr, ICompositeViewEngine _viewEngine)
+        {
+            using (StringWriter writer = new StringWriter())
+            {
+                ViewEngineResult vResult = _viewEngine.FindView(controllerContext, pvr.ViewName, false);
+                ViewContext viewContext = new ViewContext(controllerContext, vResult.View, pvr.ViewData, pvr.TempData, writer, new HtmlHelperOptions());
+                await vResult.View.RenderAsync(viewContext);
+                return writer.GetStringBuilder().ToString();
+            }
+        }
+        #endregion
+    }
+}
+
+
+
+
+
+
+
+
+using DCCO.Kernel.Core.Constants;
+using DCCO.Kernel.Core.Controllers;
+using DCCO.Kernel.Core.Helpers;
+using DCCO.Presentation.DCCO.Infrastructure.Persistence.Repositories.Identities;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc.Filters;
+
+namespace DCCO.Presentation.DCCO.Web.UsersSecurity
+{
+    public class AuthorizeLoginFilter : IActionFilter
+    {
+        public static IHttpContextAccessor _httpContextAccessor { get { return new HttpContextAccessor(); } }
+        public void OnActionExecuted(ActionExecutedContext context) { }
+
+        public void OnActionExecuting(ActionExecutingContext context)
+        {
+            var controller = (BaseController)context.Controller;
+            if (_httpContextAccessor.HttpContext.Session.GetString(SessionKey.IDNumber) != null && _httpContextAccessor.HttpContext.Session.GetString(SessionKey.SessionId) != null)
+            {
+                if (!controller.ToString().Contains(Security.Decrypt(_httpContextAccessor.HttpContext.Session.GetString(SessionKey.Role))))
+                    context.Result = controller.RedirectToAction("AccessDenied", "Shared");
+                IUserService userService = (IUserService)_httpContextAccessor.HttpContext.RequestServices.GetService(typeof(IUserService));
+
+                var ssesionId = Security.Decrypt(_httpContextAccessor.HttpContext.Session.GetString(SessionKey.SessionId));
+                var iDNumber = Security.Decrypt(_httpContextAccessor.HttpContext.Session.GetString(SessionKey.IDNumber));
+                // check to see if your ID in the Logins table has LoggedIn = true - if so, continue, otherwise, redirect to Login page.
+                if (userService.IsUserStillLogin(iDNumber, ssesionId))
+                {
+                    // check to see if your user ID is being used elsewhere under a different session ID
+                    if (!userService.IsUserLoggedOnElseWhere(iDNumber, ssesionId))
+                    {
+                        return;
+                    }
+                    else
+                    {
+                        // if it is being used elsewhere, update all their Logins records to LoggedIn = false, except for your session ID
+                        userService.LogEveryoneElseOut(iDNumber, ssesionId);
+                        return;
+                    }
+                }
+                else
+                {
+                    context.Result = controller.RedirectToAction("Login", "Home");
+                }
+            }
+            else
+            {
+                context.Result = controller.RedirectToAction("Login", "Home");
+            }
+        }
+    }
+}
+
+
+
+
+
+@using DCCO.Kernel.Core.Enums.DCCO;
+@model DCCO.Presentation.DCCO.Domain.DTOs.AccountInfoUpdate.AccountInfoUpdateDTO
+
+<style>
+    table[role="grid"] .k-header[data-index="3"], table[role="grid"] tr td:nth-child(4) {
+        display: inline-block;
+        width: 350px;
+    }
+
+    .mdl-textfield textarea {
+        height: 60px !important;
+    }
+
+    .addressEdit {
+        display: block;
+        width: 60%;
+        margin: 0 auto;
+    }
+
+    textarea {
+        font-size: .8rem;
+        letter-spacing: 1px;
+    }
+
+    textarea {
+        padding: 10px;
+        line-height: 1.5;
+        border-radius: 5px;
+        border: 1px solid #ccc;
+        box-shadow: 1px 1px 1px #999;
+    }
+
+    .disabledFields {
+        background: #f7f7f7;
+        border: 1px solid rgba(0,0,0,.12) !important;
+        color: black !important;
+    }
+</style>
+
+
+<div class="container">
+    <div>
+        <div class="get-started" style="padding-top:2%;text-align:center">
+            <h1>@Localizer["MakerPage"]</h1>
+        </div>
+        <br />
+        <br />
+    </div>
+
+
+    @using (Html.BeginForm("ApplicationJourney", "Maker", FormMethod.Post, new { autocomplete = "off", @Id = "formApplicationJourney" }))
+    {
+        @Html.AntiForgeryToken()
+        <input type="hidden" asp-for="JourneyAction" id="hdn-journey-action">
+        <input type="hidden" asp-for="ActiveStep" id="hdn-active-step" value="@Model.ActiveStep">
+        <div id="dvSteps">
+            @if (ViewData["Partial"] != null)
+            {
+                @Html.Raw(ViewData["Partial"].ToString())
+            }
+        </div>
+    }
+    <!--Button next previous-->
+    <div class="row mortgage-btns main-padding py-4 mb-4" id="buttons-div">
+        <div class="col-12 d-flex justify-content-end align-items-center flex-fill">
+            <button class="btn btn-outline-secondary rounded-circle btn-back" type="button" id="btn-back" onclick="Steps.Action('@((int)JourneyActions.Back)')">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M15.75 4.5L8.25 12L15.75 19.5" stroke="#16171D" stroke-width="1.5" stroke-linejoin="round" />
+                </svg>
+            </button>
+            <button class="btn btn-outline-secondary btn-sm d-flex text-center flex-fill align-items-center justify-content-center" onclick="Steps.Action('@((int)JourneyActions.SaveForLater)')">
+                @Localizer["SaveForLater"]
+            </button>
+            <button class="btn btn-primary rounded-pill d-block btn-next pe-lg-4" type="button" id="btn-next" onclick="Steps.Action('@((int)JourneyActions.Continue)')">
+                <span class="d-none d-lg-inline-block" id="spn-nxt-stp"></span>
+                <svg class="d-inline-block" xmlns="http://www.w3.org/2000/svg" width="25" height="25" viewBox="0 0 25 25">
+                    <g id="back" transform="translate(620 -939)">
+                        <rect id="Rectangle_26" data-bs-name="Rectangle 26" width="25" height="25" transform="translate(-620 939)" fill="none" />
+                        <path id="Path_248" data-bs-name="Path 248" d="M8.25,19.5l7.5-7.5L8.25,4.5" transform="translate(-619.5 939.5)" fill="none" stroke="#16171d" stroke-linejoin="round" stroke-width="1.5" />
+                    </g>
+                </svg>
+            </button>
+            <button class="btn btn-primary rounded-pill d-block btn-submit pe-lg-4" type="button" id="btn-submit" onclick="Steps.Action('@((int)JourneyActions.Submit)')">
+                <span>@Localizer["Submit"]</span>
+            </button>
+        </div>
+    </div>
+
+</div>
+<script src="~/js/app/StepsWizard.js"></script>
+
+<script>
+
+    var stepsTitle = {
+        1: '@Localizer["EntityBasicInformation"]',
+        2: '@Localizer["EntityPartiesDetails"]',
+        3: '@Localizer["AddParty"]',
+        4: '@Localizer["EntityAlertsAndAddress"]',
+        5: '@Localizer["TaxSelfCertification"]',
+        6: '@Localizer["EntityProductsAndServices"]',
+        7: '@Localizer["CIB_OnlineBankingEnrollment"]',
+        8: '@Localizer["RequiredDocuments"]',
+        9: '@Localizer["Submit"]'
+    };
+
+    var stepsEnum = {
+        EntityBasicInformation: 1,
+        EntityPartiesDetails: 2,
+        AddParty : 3,
+        EntityAlertsAndAddress: 4,
+        TaxSelfCertification: 5,
+        EntityProductsAndServices: 6,
+        CIB_OnlineBankingEnrollment: 7,
+        RequiredDocuments: 8,
+        Submit: 9,
+    };
+
+    var journeyActions = {
+        Continue: '@((int)JourneyActions.Continue)',
+        Back: '@((int)JourneyActions.Back)',
+        SaveForLater: '@((int)JourneyActions.SaveForLater)',
+        AddNewParty: '@((int)JourneyActions.AddNewParty)',
+        Add_UpdatePassiveNFFEEntity: '@((int)JourneyActions.Add_UpdatePassiveNFFEEntity)',
+        DeletePassiveNFFEEntity: '@((int)JourneyActions.DeletePassiveNFFEEntity)',
+        Add_UpdatePassiveNFFEController: '@((int)JourneyActions.Add_UpdatePassiveNFFEController)',
+        DeletePassiveNFFEController: '@((int)JourneyActions.DeletePassiveNFFEController)',
+        Submit: '@((int)JourneyActions.Submit)',
+    };
+
+    Steps.OnLoad();
+
+    $(document).ready(function () {
+        //$('.nav-link.marketplace').removeClass('active');
+        //$('.nav-link.mortgage').addClass('active');
+        });
+</script>
+
+
+
+let activeStep = 0;
+
+var Steps = {
+    OnLoad: function () {
+        var activeStep = $('#hdn-active-step').val();
+
+        if (parseInt(activeStep) == 3)
+            $('#spn-nxt-stp').html(stepsTitle[parseInt(activeStep)]);
+        else if (parseInt(activeStep) == 2)
+            $('#spn-nxt-stp').html(stepsTitle[parseInt(activeStep) + 2]);
+        else
+            $('#spn-nxt-stp').html(stepsTitle[parseInt(activeStep) + 1]);
+
+        Steps.ButtonsSettings(activeStep);
+
+        Steps.CheckedRadio();
+        Steps.PrepareHijriCalendars();
+    },
+    Action: function (status) {
+        //if (!$('#formApplicationJourney').valid())
+        //    return;
+        $('#hdn-journey-action').val(status);
+
+        // Post for Steps
+        $.ajax({
+            cache: false,
+            type: 'POST',
+            url: $('#formApplicationJourney').attr('action'),
+            data: $('#formApplicationJourney').serialize(),
+            dataType: 'json',
+            success: function (data) {
+                if (data.resultCode == 422) {
+                    $('span[data-valmsg-for]').html('');
+                    for (var i = 0; i < data.brokenRoles.length; i++) {
+                        var docReference = data.brokenRoles[i]["propertyName"];
+                        var message = data.brokenRoles[i]["message"];
+                        var errorElement = $("span[data-valmsg-for='" + docReference + "']");
+
+                        errorElement.html(message);
+                        $('.file-box-' + docReference).removeClass('uploaded').addClass('not-uploaded');
+
+                        // Check if the error element is visible at the top of the page
+                        if (errorElement.is(":visible") && errorElement.offset().top < $(window).scrollTop()) {
+                            // Scroll the page to the top to make the error message visible
+                            $("html, body").animate({ scrollTop: errorElement.offset().top }, 500);
+                        }
+                    }
+                }
+                else if (data.resultCode == 200) {
+                    if (status == journeyActions.Continue || status == journeyActions.Back || status == journeyActions.AddNewParty) {
+                        Steps.GoTo(data, true);
+                    } else if (status == journeyActions.Add_UpdatePassiveNFFEEntity || status == journeyActions.Add_UpdatePassiveNFFEController ||
+                        status == journeyActions.DeletePassiveNFFEEntity || status == journeyActions.DeletePassiveNFFEController) {
+                        location.reload();
+                    }
+                    else if (status == journeyActions.SaveForLater && data.url != '') {
+                        GeneralClass.AlertMessage(publicResources.ApplicationSavedSuccessFully, '', AlertsType.Info);
+                    }
+                }
+                else {
+                    GeneralClass.AlertMessage(publicResources.ErrorOccurred, '', AlertsType.Warning);
+                }
+            },
+            error: function (e) {
+                console.log(e.responseText);
+            }
+        });
+    },
+    CheckedRadio: function () {
+        $('input[type="radio"]:checked').each(function () {
+            $(this).parent().addClass('checked');
+        });
+
+        $('input[type="radio"]').on('click', function () {
+            var elementName = $(this).attr('name');
+            $('input[type="radio"]').each(function () {
+                if ($(this).attr('name') === elementName) {
+                    $(this).parent().removeClass('checked');
+                }
+            });
+            $(this).parent().addClass('checked');
+        });
+    },
+    ButtonsSettings: function (activeStep) {
+        //Hide back
+        if (activeStep == stepsEnum.EntityBasicInformation)
+            $('#btn-back').addClass('d-none');
+        else
+            $('#btn-back').removeClass('d-none');
+
+        if (activeStep != stepsEnum.Submit) {
+            $('#btn-submit').addClass('d-none');
+            $('#btn-next').removeClass('d-none');
+        }
+        else {
+            $('#btn-submit').removeClass('d-none');
+            $('#btn-next').addClass('d-none');
+        }
+    },
+    GoTo: function (data, isWithNxtStep) {
+        var activeStep = data.next;
+        $('#hdn-active-step').val(activeStep);
+        if (isWithNxtStep) {
+            if (parseInt(activeStep) == 3)
+                $('#spn-nxt-stp').html(stepsTitle[parseInt(activeStep)]);
+            else if (parseInt(activeStep) == 2)
+                $('#spn-nxt-stp').html(stepsTitle[parseInt(activeStep) + 2]);
+            else
+                $('#spn-nxt-stp').html(stepsTitle[parseInt(activeStep) + 1]);
+        }
+        $('.main-steps').find('.progress-step').removeClass('is-active');
+        $('.main-steps .progress-tracker li[data-step="' + data.stage + '"]').addClass('is-active');
+        $('#dvSteps').html(data.step);
+        $('#hdn-isMoveOAO').val(data.isOAO);
+        $('#hdn-go-home').val(data.goToHome)
+        Steps.ButtonsSettings(activeStep);
+        Steps.CheckedRadio();
+        Steps.PrepareHijriCalendars();
+        window.scrollTo(0, 0);
+    },
+    PrepareHijriCalendars: function () {
+        $('.dateDOBHijri').each(function () {
+            var local = _SystemLanguge;
+
+            // Set locale based on language
+            var local = "en-US";
+            if (_SystemLanguge == 'ar') {
+                local = "ar-SA";
+            }
+
+            var maxDate = '';
+            var minDate = '';
+            var showinDate = '';
+            var today = new Date();
+            var dd = today.getDate();
+            var mm = today.getMonth() + 1;
+            var yyyy = today.getFullYear();
+
+            if (typeof $(this).attr('dataDate') != 'undefined') {
+                var date = mm + '/' + dd + '/' + (yyyy - $(this).attr('dataDate').slice(1, -1));
+                var newDate = date.split('/');
+                if (newDate[0].length == 1)
+                    newDate[0] = "0" + newDate[0];
+                if (newDate[1].length == 1)
+                    newDate[1] = "0" + newDate[1];
+
+                maxDate = newDate[2] + '/' + newDate[0] + '/' + newDate[1];
+                showinDate = (parseInt(newDate[2]) - 2) + '/' + newDate[0] + '/' + newDate[1];
+            }
+
+            $(this).hijriDatePicker({
+                locale: local, // Set locale for Gregorian date picker
+                hijri: true,
+                format: "iDD/iMM/iYYYY",
+                showSwitcher : false
+            });
+
+            $(this).next('.hijriDatePicker-toggle').hide();
+
+            $(this).on('keypress', function (e) {
+                var leng = $(this).val().length;
+
+                if (window.event) {
+                    code = e.keyCode;
+                } else {
+                    code = e.which;
+                }
+
+                var allowedCharacters = { 49: 1, 50: 2, 51: 3, 52: 4, 53: 5, 54: 6, 55: 7, 56: 8, 57: 9, 48: 0, 47: '/' }; /* KeyCodes for 1,2,3,4,5,6,7,8,9,/ */
+
+                if (typeof allowedCharacters[code] === 'undefined' || /* Can only input 1,2,3,4,5,6,7,8,9 or / */
+                    (code == 47 && (leng < 2 || leng > 5 || leng == 3 || leng == 4)) ||
+                    ((leng == 2 || leng == 5) && code !== 47) || /* only can hit a / for 3rd pos. */
+                    leng == 10) /* only want 10 characters "12/45/7890" */ {
+
+                    event.preventDefault();
+
+                    return;
+                }
+            });
+        });
+
+        $('.dateDOBGregorian').each(function () {
+            var local = _SystemLanguge;
+
+            // Set locale based on language
+            var local = "en-US";
+            if (_SystemLanguge == 'ar') {
+                local = "ar-SA";
+            }
+
+            var maxDate = '';
+            var minDate = '';
+            var showinDate = '';
+            var today = new Date();
+            var dd = today.getDate();
+            var mm = today.getMonth() + 1;
+            var yyyy = today.getFullYear();
+
+            if (typeof $(this).attr('dataDate') != 'undefined') {
+                var date = mm + '/' + dd + '/' + (yyyy - $(this).attr('dataDate').slice(1, -1));
+                var newDate = date.split('/');
+                if (newDate[0].length == 1)
+                    newDate[0] = "0" + newDate[0];
+                if (newDate[1].length == 1)
+                    newDate[1] = "0" + newDate[1];
+
+                maxDate = newDate[2] + '/' + newDate[0] + '/' + newDate[1];
+                showinDate = (parseInt(newDate[2]) - 2) + '/' + newDate[0] + '/' + newDate[1];
+            }
+
+            $(this).hijriDatePicker({
+                locale: local, // Set locale for Gregorian date picker
+                format: "YYYY-MM-DD",
+                hijri: false,
+                showSwitcher: false
+            });
+            $(this).on('keypress', function (e) {
+                var leng = $(this).val().length;
+
+                if (window.event) {
+                    code = e.keyCode;
+                } else {
+                    code = e.which;
+                }
+
+                var allowedCharacters = { 49: 1, 50: 2, 51: 3, 52: 4, 53: 5, 54: 6, 55: 7, 56: 8, 57: 9, 48: 0, 47: '/' }; /* KeyCodes for 1,2,3,4,5,6,7,8,9,/ */
+
+                if (typeof allowedCharacters[code] === 'undefined' || /* Can only input 1,2,3,4,5,6,7,8,9 or / */
+                    (code == 47 && (leng < 2 || leng > 5 || leng == 3 || leng == 4)) ||
+                    ((leng == 2 || leng == 5) && code !== 47) || /* only can hit a / for 3rd pos. */
+                    leng == 10) /* only want 10 characters "12/45/7890" */ {
+
+                    event.preventDefault();
+
+                    return;
+                }
+            });
+        });
+    },
+    ConvertHijriToGregroian: function (date) {
+        var date = calendarIslamic.parseDate(calendarFormat, date);
+        date = calendarGregorian.fromJD(date.toJD());
+        return calendarGregorian.formatDate(calendarFormat, date);
+    },
+    ConvertGregoianToHijri: function (date) {
+        var date = calendarGregorian.parseDate(calendarFormat, date);
+        date = calendarIslamic.fromJD(date.toJD());
+        return calendarIslamic.formatDate(calendarFormat, date);
+    }
+}
+
+
+var Nafad = {
+    OnStartup: function () {
+
+        //Set Timer
+        var culture = window.location.href.includes('ar') ? 'ar' : 'en';
+        $("#timer").countdown({ until: elapsedTime, format: 'S', onExpiry: Nafad.CheckNafadStatus(), culture: culture });
+
+        if (elapsedTime != null && elapsedTime < 0)
+            Nafad.CheckNafadStatus();
+
+        //SignalR
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl(`/nafadSignalR?TransactionID=${transactionID}`)
+            .build();
+
+        connection.on("ReceiveNafadStatus", function () {
+            Nafad.CheckNafadStatus();
+        });
+
+        connection.start()
+            .then(function () {
+                alert("Connected successfully");
+            })
+            .catch(function (err) {
+                alert(err.toString());
+            });
+    },
+    CheckNafadStatus: function () {
+        $('#wait_overlay').show();
+
+        $.ajax({
+            type: 'GET',
+            url: _BaseURL + '/' + _SystemLanguge + '/Home/CheckNafadStatus?transactionID=' + transactionID,
+            success: function (data) {
+                if (data.success) {
+                    window.location.href = _BaseURL + '/' + _SystemLanguge + data.url;
+                }
+                $('#wait_overlay').hide();
+            },
+            error: function (er) {
+                GeneralClass.AlertMessage(publicResources.ErrorOccurred, '', AlertsType.Warning);
+            }
+        });
+    }
+}
+
+
+
+
+
+using DCCO.Presentation.DCCO.Application.Services.Session;
+using Microsoft.AspNetCore.SignalR;
+using System;
+using System.Collections.Concurrent;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace DCCO.Presentation.DCCO.Application.Hub
+{
+    public class NafadHub : Microsoft.AspNetCore.SignalR.Hub
+    {
+        readonly ISessionService _sessionService;
+        public NafadHub(ISessionService sessionService)
+        {
+            _sessionService = sessionService;
+        }
+        private static ConcurrentDictionary<string, string> _connections =
+            new ConcurrentDictionary<string, string>();
+
+        public override Task OnConnectedAsync()
+        {
+            //Context.Request.GetHttpContext().Session["IDNumber"].ToString()
+            var transactionID = Context.GetHttpContext().Request.Query["TransactionID"].ToString();
+            if (!string.IsNullOrEmpty(transactionID))
+                _connections[transactionID] = Context.ConnectionId;
+            return base.OnConnectedAsync();
+        }
+        public override Task OnDisconnectedAsync(Exception exception)
+        {
+            var transactionID = _connections.FirstOrDefault(x => x.Value == Context.ConnectionId).Key;
+            if (transactionID != null)
+            { _connections.TryRemove(transactionID, out _); }
+            return base.OnDisconnectedAsync(exception);
+        }
+        public async Task CheckNafadStatus(string transactionID)
+        {
+            if (_connections.TryGetValue(transactionID, out string connectionId))
+                await Clients.Client(connectionId).SendAsync("ReceiveNafadStatus");
+        }
+    }
+}
+
+
+
+ await _nafadRepository.UpdateNafadLog(MapEnvelopeToNafadLog(nafadLog, envelope));
+
+                HubConnection _connection = new HubConnectionBuilder()
+                    .WithUrl(_config.GetValue<string>("HubUrl"))
+                    .Build();
+
+
+
+                await _connection.StartAsync();
+                await _connection.InvokeAsync("CheckNafadStatus", envelope.Header.RespHeader.TransactionId);
+                await _connection.StopAsync();
